@@ -633,5 +633,27 @@
   "overlay": {
     "transcribing": "Transcribing...",
     "processing": "Processing..."
+  },
+  "panel": {
+    "startRecording": "Start Recording",
+    "endRecording": "End Recording",
+    "transcribing": "Transcribing…",
+    "transcribingFile": "Transcribing {{name}}…",
+    "recordingHint": "Recording — click to stop and transcribe",
+    "idleHint": "Long recording · saved to history and copied",
+    "importTitle": "Transcribe a file",
+    "importHint": "Drop audio or video here, or click to choose",
+    "dropNow": "Release to transcribe",
+    "copyLast": "Copy Last Transcript",
+    "copied": "Copied",
+    "nothingToCopy": "No transcript yet",
+    "lastTranscript": "Last transcript",
+    "noTranscript": "Your latest transcript will appear here.",
+    "settings": "Settings",
+    "openApp": "Open Handy",
+    "discard": "Discard",
+    "quit": "Quit",
+    "doneCopied": "Done — transcript copied to clipboard",
+    "busy": "Handy is busy"
   }
 }

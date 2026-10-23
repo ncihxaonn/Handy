@@ -11,6 +11,7 @@ mod helpers;
 mod input;
 mod llm_client;
 mod managers;
+mod menubar_panel;
 mod overlay;
 pub mod portable;
 mod settings;
@@ -93,7 +94,7 @@ fn build_console_filter() -> env_filter::Filter {
     builder.build()
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(main_window) = app.get_webview_window("main") {
         if let Err(e) = main_window.unminimize() {
             log::error!("Failed to unminimize webview window: {}", e);
@@ -181,6 +182,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
     app_handle.manage(tray::CurrentTrayIconState::new());
+    app_handle.manage(menubar_panel::PanelState::new());
 
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command
@@ -219,8 +221,20 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             .unwrap(),
         )
         .tooltip(tray::tray_tooltip())
-        .show_menu_on_left_click(true)
+        // Left click opens the quick panel; right click still shows the menu.
+        .show_menu_on_left_click(false)
         .icon_as_template(true)
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                rect,
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                menubar_panel::toggle_panel(tray.app_handle(), rect);
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "settings" => {
                 show_main_window(app);
@@ -309,6 +323,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Create the recording overlay window (hidden by default)
     utils::create_recording_overlay(app_handle);
+
+    menubar_panel::create_panel(app_handle);
 }
 
 #[tauri::command]
@@ -629,6 +645,15 @@ pub fn run(cli_args: CliArgs) {
             shortcut::handy_keys::stop_handy_keys_recording,
             trigger_update_check,
             show_main_window_command,
+            menubar_panel::get_panel_status,
+            menubar_panel::start_panel_recording,
+            menubar_panel::stop_panel_recording,
+            menubar_panel::cancel_panel_recording,
+            menubar_panel::transcribe_panel_file,
+            menubar_panel::get_last_transcript,
+            menubar_panel::copy_last_transcript_command,
+            menubar_panel::open_main_window_from_panel,
+            menubar_panel::get_selected_model_name,
             commands::cancel_operation,
             commands::is_portable,
             commands::get_app_dir_path,

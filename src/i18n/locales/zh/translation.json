@@ -633,5 +633,27 @@
   },
   "whatsNew": {
     "title": "Handy v{{version}} 新功能"
+  },
+  "panel": {
+    "startRecording": "开始录音",
+    "endRecording": "结束录音",
+    "transcribing": "正在转写…",
+    "transcribingFile": "正在转写 {{name}}…",
+    "recordingHint": "录音中 — 点击结束并转写",
+    "idleHint": "长录音 · 自动保存到历史并复制",
+    "importTitle": "转写文件",
+    "importHint": "拖入音频或视频，或点击选择文件",
+    "dropNow": "松开即可转写",
+    "copyLast": "复制上一次转写",
+    "copied": "已复制",
+    "nothingToCopy": "还没有转写记录",
+    "lastTranscript": "上一次转写",
+    "noTranscript": "最新的转写内容会显示在这里。",
+    "settings": "设置",
+    "openApp": "打开 Handy",
+    "discard": "放弃",
+    "quit": "退出",
+    "doneCopied": "完成 — 转写内容已复制",
+    "busy": "Handy 正忙"
   }
 }
