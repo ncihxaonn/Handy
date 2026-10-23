@@ -182,6 +182,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
     app_handle.manage(tray::CurrentTrayIconState::new());
+    #[cfg(target_os = "macos")]
+    app_handle.manage(tray::TrayMenuState::new());
     app_handle.manage(menubar_panel::PanelState::new());
 
     // Note: Shortcuts are NOT initialized here.
@@ -237,12 +239,21 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             }
             if let tauri::tray::TrayIconEvent::Click {
                 rect,
-                button: tauri::tray::MouseButton::Left,
+                button,
                 button_state: tauri::tray::MouseButtonState::Up,
                 ..
             } = event
             {
-                menubar_panel::toggle_panel(tray.app_handle(), rect);
+                match button {
+                    tauri::tray::MouseButton::Left => {
+                        menubar_panel::toggle_panel(tray.app_handle(), rect);
+                    }
+                    #[cfg(target_os = "macos")]
+                    tauri::tray::MouseButton::Right => {
+                        tray::show_tray_menu(tray.app_handle());
+                    }
+                    _ => {}
+                }
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {

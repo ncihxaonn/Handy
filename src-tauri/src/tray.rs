@@ -7,12 +7,47 @@ use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::image::Image;
+#[cfg(target_os = "macos")]
+use tauri::menu::ContextMenu;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Manager, Theme};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 pub const TRAY_ID: &str = "handy-tray";
+
+#[cfg(target_os = "macos")]
+pub struct TrayMenuState(Mutex<Option<Menu<tauri::Wry>>>);
+
+#[cfg(target_os = "macos")]
+impl TrayMenuState {
+    pub fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn show_tray_menu(app: &AppHandle) {
+    let menu = app
+        .state::<TrayMenuState>()
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(menu) = menu else {
+        error!("Menubar tray menu is not initialized");
+        return;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        error!("Menubar tray menu requires the main window");
+        return;
+    };
+    info!("Menubar tray menu popup: opening");
+    match menu.popup(window.as_ref().window()) {
+        Ok(()) => info!("Menubar tray menu popup: closed"),
+        Err(e) => error!("Failed to show menubar tray menu: {}", e),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrayIconState {
@@ -295,6 +330,17 @@ pub fn update_tray_menu(app: &AppHandle, locale: Option<&str>) {
     };
 
     let tray = app.state::<TrayIcon>();
+    #[cfg(target_os = "macos")]
+    {
+        *app.state::<TrayMenuState>()
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(menu);
+        if let Err(e) = tray.set_menu(None::<Menu<tauri::Wry>>) {
+            error!("Failed to detach the native menubar menu: {}", e);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Err(e) = tray.set_menu(Some(menu)) {
         error!("Failed to set tray menu: {}", e);
     }
