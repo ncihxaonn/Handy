@@ -109,6 +109,12 @@ export default function MenubarPanel() {
   );
 
   useEffect(() => {
+    void invoke("panel_frontend_ready").catch((error) => {
+      console.error("Failed to report menubar panel readiness:", error);
+    });
+  }, []);
+
+  useEffect(() => {
     refresh();
     const unlisteners = [
       listen("panel-shown", () => {

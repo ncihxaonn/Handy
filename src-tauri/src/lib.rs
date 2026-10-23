@@ -42,7 +42,7 @@ use tauri::image::Image;
 pub use transcription_coordinator::TranscriptionCoordinator;
 
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Listener, Manager};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_log::{Builder as LogBuilder, RotationStrategy, Target, TargetKind};
 
@@ -201,7 +201,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     {
         let settings = settings::get_settings(app_handle);
         if settings.start_hidden && settings.show_tray_icon {
-            let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            match app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory) {
+                Ok(()) => log::info!("Handy macOS activation policy: Accessory"),
+                Err(e) => log::warn!("Failed to set Handy macOS activation policy: {}", e),
+            }
         }
     }
     // Get the current theme to set the appropriate initial icon
@@ -210,7 +213,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     // Choose the appropriate initial icon based on theme
     let initial_icon_path = tray::get_icon_path(initial_theme, tray::TrayIconState::Idle);
 
-    let tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::with_id(tray::TRAY_ID)
         .icon(
             Image::from_path(
                 app_handle
@@ -225,6 +228,13 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         .show_menu_on_left_click(false)
         .icon_as_template(true)
         .on_tray_icon_event(|tray, event| {
+            if !matches!(event, tauri::tray::TrayIconEvent::Move { .. }) {
+                log::info!(
+                    "Menubar tray event: tray_id={} event={:?}",
+                    tray.id().as_ref(),
+                    event
+                );
+            }
             if let tauri::tray::TrayIconEvent::Click {
                 rect,
                 button: tauri::tray::MouseButton::Left,
@@ -240,11 +250,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 show_main_window(app);
             }
             "check_updates" => {
-                let settings = settings::get_settings(app);
-                if settings.update_checks_enabled {
-                    show_main_window(app);
-                    let _ = app.emit("check-for-updates", ());
-                }
+                log::info!("Official tray update check ignored in menubar-panel build");
             }
             "copy_last_transcript" => {
                 tray::copy_last_transcript(app);
@@ -292,6 +298,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         })
         .build(app_handle)
         .unwrap();
+    log::info!(
+        "Menubar tray created: tray_id={} left_click=panel right_click=menu official_updater=disabled",
+        tray.id().as_ref()
+    );
     app_handle.manage(tray);
 
     // Initialize tray menu with idle state
@@ -329,13 +339,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
 #[tauri::command]
 #[specta::specta]
-fn trigger_update_check(app: AppHandle) -> Result<(), String> {
-    let settings = settings::get_settings(&app);
-    if !settings.update_checks_enabled {
-        return Ok(());
-    }
-    app.emit("check-for-updates", ())
-        .map_err(|e| e.to_string())?;
+fn trigger_update_check() -> Result<(), String> {
+    log::info!("Official update check ignored in menubar-panel build");
     Ok(())
 }
 
@@ -646,6 +651,7 @@ pub fn run(cli_args: CliArgs) {
             trigger_update_check,
             show_main_window_command,
             menubar_panel::get_panel_status,
+            menubar_panel::panel_frontend_ready,
             menubar_panel::start_panel_recording,
             menubar_panel::stop_panel_recording,
             menubar_panel::cancel_panel_recording,
@@ -804,7 +810,6 @@ pub fn run(cli_args: CliArgs) {
     builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
@@ -901,6 +906,11 @@ pub fn run(cli_args: CliArgs) {
             // viewer is the sole consumer and only exists in debug mode). This also
             // honors the runtime `--debug` override applied to `settings` above.
             WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
+            log::info!(
+                "Handy menubar-panel build started: version={} quick_panel=2 official_updater=disabled executable={:?}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::current_exe()
+            );
             let app_handle = app.handle().clone();
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 

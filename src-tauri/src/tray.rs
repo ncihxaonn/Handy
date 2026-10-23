@@ -12,6 +12,8 @@ use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Manager, Theme};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+pub const TRAY_ID: &str = "handy-tray";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrayIconState {
     Idle,
@@ -196,7 +198,7 @@ pub fn update_tray_menu(app: &AppHandle, locale: Option<&str>) {
         app,
         "check_updates",
         &strings.check_updates,
-        settings.update_checks_enabled,
+        false,
         None::<&str>,
     )
     .expect("failed to create check updates item");
@@ -293,7 +295,12 @@ pub fn update_tray_menu(app: &AppHandle, locale: Option<&str>) {
     };
 
     let tray = app.state::<TrayIcon>();
-    let _ = tray.set_menu(Some(menu));
+    if let Err(e) = tray.set_menu(Some(menu)) {
+        error!("Failed to set tray menu: {}", e);
+    }
+    if let Err(e) = tray.set_show_menu_on_left_click(false) {
+        error!("Failed to keep the menubar panel on left click: {}", e);
+    }
     let _ = tray.set_icon_as_template(true);
     let _ = tray.set_tooltip(Some(version_label));
 }

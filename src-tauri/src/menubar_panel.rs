@@ -16,17 +16,83 @@ use specta::Type;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, Rect, WebviewUrl, WebviewWindowBuilder,
-    WindowEvent,
+    AppHandle, Emitter, LogicalPosition, Manager, Rect, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
+
+#[cfg(target_os = "macos")]
+use tauri_nspanel::{
+    objc2_app_kit::NSScreen, tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask,
+    WebviewWindowExt,
+};
+
+#[cfg(target_os = "macos")]
+tauri_panel! {
+    panel!(MenubarQuickPanel {
+        config: {
+            can_become_key_window: true,
+            can_become_main_window: false,
+            is_floating_panel: true
+        }
+    })
+}
 
 pub const PANEL_LABEL: &str = "menubar_panel";
 const PANEL_WIDTH: f64 = 320.0;
 const PANEL_HEIGHT: f64 = 404.0;
 const MEETING_BINDING_ID: &str = "menubar_meeting";
 const STATUS_EVENT: &str = "panel-status-changed";
+const PANEL_BLUR_GUARD: Duration = Duration::from_millis(400);
+
+struct PanelWindowState(Mutex<Option<Instant>>);
+
+impl PanelWindowState {
+    fn shown_at(&self) -> Option<Instant> {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn set_shown_at(&self, shown_at: Option<Instant>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = shown_at;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PanelRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tray_icon_rect(tray_rect: Rect, scale: f64, screen_top: f64) -> PanelRect {
+    let position = tray_rect.position.to_logical::<f64>(scale);
+    let size = tray_rect.size.to_logical::<f64>(scale);
+    PanelRect {
+        x: position.x,
+        y: screen_top,
+        width: size.width,
+        height: size.height,
+    }
+}
+
+fn calculate_panel_position(icon: PanelRect, work_area: PanelRect) -> (f64, f64) {
+    let gap = 6.0;
+    let left = work_area.x + gap;
+    let right = work_area.x + work_area.width - PANEL_WIDTH - gap;
+    let x = (icon.x + icon.width / 2.0 - PANEL_WIDTH / 2.0).clamp(left, right.max(left));
+    let top = work_area.y + gap;
+    let bottom = work_area.y + work_area.height - PANEL_HEIGHT - gap;
+    let y = (icon.y + icon.height + gap).clamp(top, bottom.max(top));
+    (x, y)
+}
+
+fn should_dismiss_on_blur(visible: bool, focused: bool, shown_elapsed: Option<Duration>) -> bool {
+    visible && !focused && shown_elapsed.is_some_and(|elapsed| elapsed >= PANEL_BLUR_GUARD)
+}
 
 #[derive(Clone, Debug, Default, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +143,7 @@ fn fail(app: &AppHandle, message: String) {
 /* ---------- window --------------------------------------------------------- */
 
 pub fn create_panel(app: &AppHandle) {
+    app.manage(PanelWindowState(Mutex::new(None)));
     let result = WebviewWindowBuilder::new(
         app,
         PANEL_LABEL,
@@ -85,61 +152,405 @@ pub fn create_panel(app: &AppHandle) {
     .title("Handy")
     .inner_size(PANEL_WIDTH, PANEL_HEIGHT)
     .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
     .decorations(false)
     .transparent(true)
     .shadow(true)
     .always_on_top(true)
     .skip_taskbar(true)
+    .accept_first_mouse(true)
+    .focused(false)
     .visible(false)
+    .on_page_load(|_, payload| {
+        info!(
+            "Menubar panel page load: event={:?} url={}",
+            payload.event(),
+            payload.url()
+        );
+    })
     .build();
 
     match result {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    error!("Menubar panel creation requires the main thread");
+                    return;
+                };
+                let panel = match window.to_panel::<MenubarQuickPanel>() {
+                    Ok(panel) => panel,
+                    Err(e) => {
+                        error!("Failed to convert menubar panel to NSPanel: {}", e);
+                        return;
+                    }
+                };
+                panel.set_level(PanelLevel::Status.value());
+                panel.set_style_mask(
+                    StyleMask::empty()
+                        .borderless()
+                        .nonactivating_panel()
+                        .value(),
+                );
+                panel.set_hides_on_deactivate(false);
+                panel.set_becomes_key_only_if_needed(false);
+                panel.set_collection_behavior(
+                    CollectionBehavior::new()
+                        .can_join_all_spaces()
+                        .full_screen_auxiliary()
+                        .value(),
+                );
+                panel.hide();
+                info!(
+                    "Menubar panel native configuration: can_become_key={} can_become_main={} activation_policy={:?}",
+                    panel.can_become_key_window(),
+                    panel.can_become_main_window(),
+                    tauri_nspanel::objc2_app_kit::NSApplication::sharedApplication(mtm).activationPolicy()
+                );
+            }
+
             let handle = window.clone();
             window.on_window_event(move |event| {
-                if let WindowEvent::Focused(false) = event {
-                    let _ = handle.hide();
+                if let WindowEvent::Focused(focused) = event {
+                    info!("Menubar panel focus changed: focused={}", focused);
+                    if !focused {
+                        handle_panel_blur(&handle);
+                    }
                 }
             });
+            info!(
+                "Menubar panel created: label={} native={} url=src/panel/index.html visible=false blur_guard_ms={}",
+                PANEL_LABEL,
+                if cfg!(target_os = "macos") { "NSPanel" } else { "window" },
+                PANEL_BLUR_GUARD.as_millis()
+            );
         }
         Err(e) => error!("Failed to create menubar panel: {}", e),
     }
 }
 
-/// Toggle the panel, anchoring it under the tray icon that was clicked.
+fn handle_panel_blur(window: &WebviewWindow) {
+    let shown_at = window.app_handle().state::<PanelWindowState>().shown_at();
+    let visible = window.is_visible().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
+    let elapsed = shown_at.map(|time| time.elapsed());
+    info!(
+        "Menubar panel blur: visible={} focused={} shown_ms={:?}",
+        visible,
+        focused,
+        elapsed.map(|time| time.as_millis())
+    );
+    if should_dismiss_on_blur(visible, focused, elapsed) {
+        info!("Menubar panel blur: hiding");
+        hide_panel(window.app_handle());
+    } else if visible && !focused && elapsed.is_some_and(|time| time < PANEL_BLUR_GUARD) {
+        info!("Menubar panel blur: deferred during show guard");
+        let window = window.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(PANEL_BLUR_GUARD.saturating_sub(elapsed.unwrap_or_default()));
+            let handle = window.clone();
+            if let Err(e) = window.run_on_main_thread(move || {
+                let current = handle.app_handle().state::<PanelWindowState>().shown_at();
+                if current == shown_at {
+                    handle_panel_blur(&handle);
+                }
+            }) {
+                warn!("Failed to recheck menubar panel blur: {}", e);
+            }
+        });
+    } else {
+        info!("Menubar panel blur: ignored");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn panel_position(_window: &WebviewWindow, tray_rect: Rect) -> Result<(f64, f64), String> {
+    let mtm = MainThreadMarker::new().ok_or("Panel positioning requires the main thread")?;
+    let screens = NSScreen::screens(mtm);
+    let primary = screens.iter().next().ok_or("No macOS screens available")?;
+    let primary_frame = primary.frame();
+    let primary_top = primary_frame.origin.y + primary_frame.size.height;
+    let cursor = NSEvent::mouseLocation();
+    let screen = screens
+        .iter()
+        .find(|screen| {
+            let frame = screen.frame();
+            cursor.x >= frame.origin.x
+                && cursor.x < frame.origin.x + frame.size.width
+                && cursor.y >= frame.origin.y
+                && cursor.y < frame.origin.y + frame.size.height
+        })
+        .unwrap_or(primary);
+    let frame = screen.frame();
+    let visible_frame = screen.visibleFrame();
+    let scale = screen.backingScaleFactor();
+    let icon = macos_tray_icon_rect(
+        tray_rect,
+        scale,
+        primary_top - frame.origin.y - frame.size.height,
+    );
+    let work_area = PanelRect {
+        x: visible_frame.origin.x,
+        y: primary_top - visible_frame.origin.y - visible_frame.size.height,
+        width: visible_frame.size.width,
+        height: visible_frame.size.height,
+    };
+    let position = calculate_panel_position(icon, work_area);
+    info!(
+        "Menubar panel geometry: tray_rect={:?} screen={:?} work_area={:?} scale={} normalized_icon={:?} logical_position={:?}",
+        tray_rect, frame, work_area, scale, icon, position
+    );
+    Ok(position)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn panel_position(window: &WebviewWindow, tray_rect: Rect) -> Result<(f64, f64), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let icon_position = tray_rect.position.to_physical::<f64>(scale);
+    let monitor = window
+        .monitor_from_point(icon_position.x, icon_position.y)
+        .map_err(|e| e.to_string())?
+        .or(window.primary_monitor().map_err(|e| e.to_string())?)
+        .ok_or("No monitor available for menubar panel")?;
+    let scale = monitor.scale_factor();
+    let icon_position = tray_rect.position.to_logical::<f64>(scale);
+    let icon_size = tray_rect.size.to_logical::<f64>(scale);
+    let bounds = monitor.work_area();
+    let origin = bounds.position.to_logical::<f64>(scale);
+    let size = bounds.size.to_logical::<f64>(scale);
+    let icon = PanelRect {
+        x: icon_position.x,
+        y: icon_position.y,
+        width: icon_size.width,
+        height: icon_size.height,
+    };
+    let work_area = PanelRect {
+        x: origin.x,
+        y: origin.y,
+        width: size.width,
+        height: size.height,
+    };
+    let position = calculate_panel_position(icon, work_area);
+    info!(
+        "Menubar panel geometry: tray_rect={:?} work_area={:?} scale={} logical_position={:?}",
+        tray_rect, work_area, scale, position
+    );
+    Ok(position)
+}
+
 pub fn toggle_panel(app: &AppHandle, tray_rect: Rect) {
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || toggle_panel_on_main_thread(&handle, tray_rect))
+    {
+        error!("Failed to dispatch menubar panel toggle: {}", e);
+    }
+}
+
+fn toggle_panel_on_main_thread(app: &AppHandle, tray_rect: Rect) {
     let Some(window) = app.get_webview_window(PANEL_LABEL) else {
+        error!(
+            "Menubar panel toggle: window missing; tray_rect={:?}",
+            tray_rect
+        );
         return;
     };
-    if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+    let visible = match window.is_visible() {
+        Ok(visible) => visible,
+        Err(e) => {
+            error!("Menubar panel toggle: failed to read visibility: {}", e);
+            return;
+        }
+    };
+    info!(
+        "Menubar panel toggle: visible={} tray_rect={:?}",
+        visible, tray_rect
+    );
+    if visible {
+        hide_panel(app);
         return;
     }
 
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let icon_pos = tray_rect.position.to_physical::<f64>(scale);
-    let icon_size = tray_rect.size.to_physical::<f64>(scale);
-    let width = PANEL_WIDTH * scale;
-    let gap = 6.0 * scale;
-
-    let mut x = icon_pos.x + icon_size.width / 2.0 - width / 2.0;
-    // Keep the panel on the monitor that holds the tray icon.
-    if let Ok(Some(monitor)) = window.monitor_from_point(icon_pos.x, icon_pos.y) {
-        let left = monitor.position().x as f64 + gap;
-        let right = left + monitor.size().width as f64 - width - 2.0 * gap;
-        x = x.clamp(left, right.max(left));
+    let (x, y) = match panel_position(&window, tray_rect) {
+        Ok(position) => position,
+        Err(e) => {
+            error!("Menubar panel toggle: failed to calculate position: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = window.set_position(LogicalPosition::new(x, y)) {
+        error!("Menubar panel toggle: failed to set position: {}", e);
+        return;
     }
-    let y = icon_pos.y + icon_size.height + gap;
+    app.state::<PanelWindowState>()
+        .set_shown_at(Some(Instant::now()));
 
-    let _ = window.set_position(PhysicalPosition::new(x, y));
-    let _ = window.show();
-    let _ = window.set_focus();
-    let _ = window.emit("panel-shown", ());
+    #[cfg(target_os = "macos")]
+    match app.get_webview_panel(PANEL_LABEL) {
+        Ok(panel) => panel.show_and_make_key(),
+        Err(e) => {
+            error!("Menubar panel toggle: native panel missing: {:?}", e);
+            return;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Err(e) = window.show().and_then(|()| window.set_focus()) {
+            error!("Menubar panel toggle: failed to show/focus: {}", e);
+            return;
+        }
+    }
+
+    info!(
+        "Menubar panel shown: logical_position=({}, {}) visible={:?} focused={:?} actual_position={:?}",
+        x, y, window.is_visible(), window.is_focused(), window.outer_position()
+    );
+    if let Err(e) = window.emit("panel-shown", ()) {
+        warn!("Failed to notify menubar panel frontend: {}", e);
+    }
 }
 
 fn hide_panel(app: &AppHandle) {
+    app.state::<PanelWindowState>().set_shown_at(None);
     if let Some(window) = app.get_webview_window(PANEL_LABEL) {
-        let _ = window.hide();
+        match window.hide() {
+            Ok(()) => info!("Menubar panel hidden"),
+            Err(e) => error!("Failed to hide menubar panel: {}", e),
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn panel_frontend_ready(window: WebviewWindow) {
+    if window.label() == PANEL_LABEL {
+        info!("Menubar panel frontend ready: label={}", PANEL_LABEL);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn menubar_blur_during_show_is_not_dismissed() {
+        assert!(!should_dismiss_on_blur(
+            true,
+            false,
+            Some(Duration::from_millis(10))
+        ));
+    }
+
+    #[test]
+    fn menubar_position_stays_inside_a_short_monitor() {
+        let icon = PanelRect {
+            x: 500.0,
+            y: 780.0,
+            width: 24.0,
+            height: 24.0,
+        };
+        let work_area = PanelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+        };
+        let (_, y) = calculate_panel_position(icon, work_area);
+        assert!(y + PANEL_HEIGHT <= work_area.height - 6.0);
+    }
+
+    #[test]
+    fn menubar_blur_after_guard_dismisses_only_an_unfocused_visible_panel() {
+        let elapsed = Some(PANEL_BLUR_GUARD);
+        assert!(should_dismiss_on_blur(true, false, elapsed));
+        assert!(!should_dismiss_on_blur(true, true, elapsed));
+        assert!(!should_dismiss_on_blur(false, false, elapsed));
+        assert!(!should_dismiss_on_blur(true, false, None));
+    }
+
+    #[test]
+    fn menubar_position_clamps_both_horizontal_edges_on_a_negative_origin_monitor() {
+        let work_area = PanelRect {
+            x: -1920.0,
+            y: -1080.0,
+            width: 1920.0,
+            height: 1049.0,
+        };
+        for icon_x in [-1920.0, -24.0] {
+            let icon = PanelRect {
+                x: icon_x,
+                y: -1080.0,
+                width: 24.0,
+                height: 31.0,
+            };
+            let (x, y) = calculate_panel_position(icon, work_area);
+            assert!(x >= work_area.x + 6.0);
+            assert!(x + PANEL_WIDTH <= work_area.x + work_area.width - 6.0);
+            assert!(y >= work_area.y + 6.0);
+            assert!(y + PANEL_HEIGHT <= work_area.y + work_area.height - 6.0);
+        }
+    }
+
+    #[test]
+    fn menubar_position_handles_a_work_area_smaller_than_the_panel() {
+        let work_area = PanelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 200.0,
+        };
+        let icon = PanelRect {
+            x: 180.0,
+            y: 0.0,
+            width: 24.0,
+            height: 24.0,
+        };
+        assert_eq!(calculate_panel_position(icon, work_area), (6.0, 6.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menubar_retina_tray_y_uses_native_screen_top_instead_of_upstream_rect_y() {
+        let rect = Rect {
+            position: tauri::PhysicalPosition::new(1800.0, 2160.0).into(),
+            size: tauri::PhysicalSize::new(48.0, 62.0).into(),
+        };
+        let icon = macos_tray_icon_rect(rect, 2.0, 0.0);
+        assert_eq!(icon.x, 900.0);
+        assert_eq!(icon.y, 0.0);
+        assert_eq!(icon.width, 24.0);
+        assert_eq!(icon.height, 31.0);
+        let work_area = PanelRect {
+            x: 0.0,
+            y: 31.0,
+            width: 1920.0,
+            height: 1049.0,
+        };
+        let (_, y) = calculate_panel_position(icon, work_area);
+        assert!(y + PANEL_HEIGHT < work_area.height);
+    }
+
+    #[test]
+    fn menubar_build_has_no_updater_capability() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        assert!(!permissions.iter().any(|permission| {
+            permission
+                .as_str()
+                .is_some_and(|name| name.starts_with("updater:"))
+        }));
+    }
+
+    #[test]
+    fn menubar_build_has_no_official_update_endpoint() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let endpoints = config["plugins"]["updater"]["endpoints"]
+            .as_array()
+            .unwrap();
+        assert!(endpoints.is_empty());
     }
 }
 
@@ -316,7 +727,11 @@ pub fn get_last_transcript(app: AppHandle) -> Option<String> {
         .get_latest_completed_entry()
         .ok()
         .flatten()?;
-    Some(entry.post_processed_text.unwrap_or(entry.transcription_text))
+    Some(
+        entry
+            .post_processed_text
+            .unwrap_or(entry.transcription_text),
+    )
 }
 
 #[tauri::command]
@@ -353,9 +768,13 @@ fn decode_to_samples(source: &Path) -> Result<Vec<f32>, String> {
         chrono::Utc::now().timestamp_millis()
     ));
 
-    let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]
-        .into_iter()
-        .find(|p| !p.starts_with('/') || Path::new(p).exists());
+    let ffmpeg = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    .into_iter()
+    .find(|p| !p.starts_with('/') || Path::new(p).exists());
 
     let mut converted = false;
     if let Some(ffmpeg) = ffmpeg {
