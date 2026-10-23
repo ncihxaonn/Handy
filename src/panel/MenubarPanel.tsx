@@ -69,7 +69,7 @@ export default function MenubarPanel() {
   const [now, setNow] = useState(Date.now());
   const [lastTranscript, setLastTranscript] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string | null>(null);
-  const [pinned, setPinned] = useState(true);
+  const [pinned, setPinned] = useState(false);
   const [pinPending, setPinPending] = useState(false);
   const pinRevision = useRef(0);
   const [dragging, setDragging] = useState(false);

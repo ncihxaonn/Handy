@@ -10,7 +10,7 @@ use crate::managers::history::HistoryManager;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::get_settings;
 use crate::tray::{change_tray_icon, TrayIconState};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use specta::Type;
 use std::path::{Path, PathBuf};
@@ -46,20 +46,14 @@ const PANEL_WIDTH: f64 = 320.0;
 const PANEL_HEIGHT: f64 = 404.0;
 const MEETING_BINDING_ID: &str = "menubar_meeting";
 const STATUS_EVENT: &str = "panel-status-changed";
-const PANEL_BLUR_GUARD: Duration = Duration::from_millis(400);
+const PANEL_SHOW_GRACE: Duration = Duration::from_secs(5);
+const PANEL_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
 
+#[derive(Default)]
 struct PanelWindowState {
     shown_at: Mutex<Option<Instant>>,
     pinned: AtomicBool,
-}
-
-impl Default for PanelWindowState {
-    fn default() -> Self {
-        Self {
-            shown_at: Mutex::new(None),
-            pinned: AtomicBool::new(true),
-        }
-    }
+    dragging: AtomicBool,
 }
 
 impl PanelWindowState {
@@ -75,6 +69,11 @@ impl PanelWindowState {
             .shown_at
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = shown_at;
+        self.dragging.store(false, Ordering::Relaxed);
+    }
+
+    fn is_current_show(&self, shown_at: Instant) -> bool {
+        self.shown_at() == Some(shown_at)
     }
 }
 
@@ -84,6 +83,12 @@ struct PanelRect {
     y: f64,
     width: f64,
     height: f64,
+}
+
+impl PanelRect {
+    fn contains(self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -113,14 +118,16 @@ fn should_dismiss_on_blur(
     visible: bool,
     focused: bool,
     pinned: bool,
-    _cursor_over: bool,
-    _dragging: bool,
+    cursor_over: bool,
+    dragging: bool,
     shown_elapsed: Option<Duration>,
 ) -> bool {
     visible
         && !focused
         && !pinned
-        && shown_elapsed.is_some_and(|elapsed| elapsed >= PANEL_BLUR_GUARD)
+        && !cursor_over
+        && !dragging
+        && shown_elapsed.is_some_and(|elapsed| elapsed >= PANEL_SHOW_GRACE)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Type)]
@@ -246,27 +253,15 @@ pub fn create_panel(app: &AppHandle) {
                     if !focused {
                         handle_panel_blur(&handle);
                     }
-                } else if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) =
-                    event
-                {
-                    info!(
-                        "Menubar panel file drop: files={} visible={:?} focused={:?} pinned={}",
-                        paths.len(),
-                        handle.is_visible(),
-                        handle.is_focused(),
-                        handle
-                            .app_handle()
-                            .state::<PanelWindowState>()
-                            .pinned
-                            .load(Ordering::Relaxed)
-                    );
+                } else if let WindowEvent::DragDrop(event) = event {
+                    handle_panel_drag_event(&handle, event);
                 }
             });
             info!(
-                "Menubar panel created: label={} native={} url=src/panel/index.html visible=false blur_guard_ms={}",
+                "Menubar panel created: label={} native={} url=src/panel/index.html visible=false grace_ms={}",
                 PANEL_LABEL,
                 if cfg!(target_os = "macos") { "NSPanel" } else { "window" },
-                PANEL_BLUR_GUARD.as_millis()
+                PANEL_SHOW_GRACE.as_millis()
             );
         }
         Err(e) => error!("Failed to create menubar panel: {}", e),
@@ -274,41 +269,155 @@ pub fn create_panel(app: &AppHandle) {
 }
 
 fn handle_panel_blur(window: &WebviewWindow) {
+    recheck_panel_auto_hide(window, "blur");
+}
+
+#[cfg(target_os = "macos")]
+fn cursor_over_panel(window: &WebviewWindow) -> Result<bool, String> {
+    let _mtm = MainThreadMarker::new().ok_or("Cursor check requires the main thread")?;
+    let panel = window
+        .app_handle()
+        .get_webview_panel(PANEL_LABEL)
+        .map_err(|error| format!("Native panel unavailable: {:?}", error))?;
+    let frame = panel.as_panel().frame();
+    let cursor = NSEvent::mouseLocation();
+    Ok(PanelRect {
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+    }
+    .contains(cursor.x, cursor.y))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cursor_over_panel(window: &WebviewWindow) -> Result<bool, String> {
+    let cursor = window
+        .cursor_position()
+        .map_err(|error| error.to_string())?;
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    Ok(PanelRect {
+        x: f64::from(position.x),
+        y: f64::from(position.y),
+        width: f64::from(size.width),
+        height: f64::from(size.height),
+    }
+    .contains(cursor.x, cursor.y))
+}
+
+fn recheck_panel_auto_hide(window: &WebviewWindow, trigger: &str) {
     let state = window.app_handle().state::<PanelWindowState>();
-    let shown_at = state.shown_at();
+    let elapsed = state.shown_at().map(|time| time.elapsed());
     let pinned = state.pinned.load(Ordering::Relaxed);
+    let dragging = state.dragging.load(Ordering::Relaxed);
     let visible = window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
-    let elapsed = shown_at.map(|time| time.elapsed());
-    info!(
-        "Menubar panel blur: visible={} focused={} pinned={} shown_ms={:?}",
-        visible,
-        focused,
-        pinned,
-        elapsed.map(|time| time.as_millis())
-    );
-    if pinned {
-        info!("Menubar panel blur: ignored while pinned");
-    } else if should_dismiss_on_blur(visible, focused, pinned, false, false, elapsed) {
-        info!("Menubar panel blur: hiding");
+    if trigger != "timer" {
+        info!(
+            "Menubar panel auto-hide check: trigger={} visible={} focused={} pinned={} dragging={} shown_ms={:?}",
+            trigger, visible, focused, pinned, dragging, elapsed.map(|time| time.as_millis())
+        );
+    }
+    if !visible || focused || pinned {
+        return;
+    }
+    if !elapsed.is_some_and(|time| time >= PANEL_SHOW_GRACE) {
+        if trigger != "timer" {
+            info!("Menubar panel auto-hide: deferred during five-second grace");
+        }
+        return;
+    }
+    let cursor_over = match cursor_over_panel(window) {
+        Ok(cursor_over) => cursor_over,
+        Err(error) => {
+            warn!(
+                "Menubar panel auto-hide: deferring after cursor check failed: {}",
+                error
+            );
+            return;
+        }
+    };
+    if should_dismiss_on_blur(visible, focused, pinned, cursor_over, dragging, elapsed) {
+        info!(
+            "Menubar panel auto-hide: hiding trigger={} cursor_over=false dragging=false",
+            trigger
+        );
         hide_panel(window.app_handle());
-    } else if visible && !focused && elapsed.is_some_and(|time| time < PANEL_BLUR_GUARD) {
-        info!("Menubar panel blur: deferred during show guard");
-        let window = window.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(PANEL_BLUR_GUARD.saturating_sub(elapsed.unwrap_or_default()));
-            let handle = window.clone();
-            if let Err(e) = window.run_on_main_thread(move || {
-                let current = handle.app_handle().state::<PanelWindowState>().shown_at();
-                if current == shown_at {
-                    handle_panel_blur(&handle);
-                }
-            }) {
-                warn!("Failed to recheck menubar panel blur: {}", e);
-            }
-        });
+    } else if trigger == "timer" {
+        debug!(
+            "Menubar panel auto-hide: deferred because cursor_over={} dragging={}",
+            cursor_over, dragging
+        );
     } else {
-        info!("Menubar panel blur: ignored");
+        info!(
+            "Menubar panel auto-hide: deferred because cursor_over={} dragging={}",
+            cursor_over, dragging
+        );
+    }
+}
+
+fn start_panel_grace_period(window: &WebviewWindow, shown_at: Instant) {
+    info!(
+        "Menubar panel grace started: duration_ms={}",
+        PANEL_SHOW_GRACE.as_millis()
+    );
+    let window = window.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PANEL_SHOW_GRACE.saturating_sub(shown_at.elapsed())).await;
+        let mut grace_ended = true;
+        loop {
+            if !window
+                .app_handle()
+                .state::<PanelWindowState>()
+                .is_current_show(shown_at)
+            {
+                return;
+            }
+            let handle = window.clone();
+            if let Err(error) = window.run_on_main_thread(move || {
+                if !handle
+                    .app_handle()
+                    .state::<PanelWindowState>()
+                    .is_current_show(shown_at)
+                {
+                    return;
+                }
+                if grace_ended {
+                    info!("Menubar panel grace ended");
+                }
+                recheck_panel_auto_hide(&handle, if grace_ended { "grace ended" } else { "timer" });
+            }) {
+                warn!("Failed to recheck menubar panel auto-hide: {}", error);
+                return;
+            }
+            grace_ended = false;
+            tokio::time::sleep(PANEL_RECHECK_INTERVAL).await;
+        }
+    });
+}
+
+fn file_drag_active(event: &tauri::DragDropEvent) -> Option<bool> {
+    match event {
+        tauri::DragDropEvent::Enter { .. } | tauri::DragDropEvent::Over { .. } => Some(true),
+        tauri::DragDropEvent::Leave | tauri::DragDropEvent::Drop { .. } => Some(false),
+        _ => None,
+    }
+}
+
+fn handle_panel_drag_event(window: &WebviewWindow, event: &tauri::DragDropEvent) {
+    let Some(dragging) = file_drag_active(event) else {
+        return;
+    };
+    let state = window.app_handle().state::<PanelWindowState>();
+    if state.dragging.swap(dragging, Ordering::Relaxed) != dragging {
+        info!("Menubar panel file drag changed: dragging={}", dragging);
+    }
+    if let tauri::DragDropEvent::Drop { paths, .. } = event {
+        info!("Menubar panel file drop: files={}", paths.len());
+    }
+    if !dragging {
+        recheck_panel_auto_hide(window, "file drag ended");
     }
 }
 
@@ -430,8 +539,8 @@ fn toggle_panel_on_main_thread(app: &AppHandle, tray_rect: Rect) {
         error!("Menubar panel toggle: failed to set position: {}", e);
         return;
     }
-    app.state::<PanelWindowState>()
-        .set_shown_at(Some(Instant::now()));
+    let shown_at = Instant::now();
+    app.state::<PanelWindowState>().set_shown_at(Some(shown_at));
 
     #[cfg(target_os = "macos")]
     match app.get_webview_panel(PANEL_LABEL) {
@@ -449,6 +558,7 @@ fn toggle_panel_on_main_thread(app: &AppHandle, tray_rect: Rect) {
         }
     }
 
+    start_panel_grace_period(&window, shown_at);
     info!(
         "Menubar panel shown: logical_position=({}, {}) visible={:?} focused={:?} actual_position={:?}",
         x, y, window.is_visible(), window.is_focused(), window.outer_position()
@@ -507,12 +617,47 @@ mod window_tests {
     use std::time::Duration;
 
     #[test]
-    fn menubar_blur_during_show_is_not_dismissed() {
-        assert!(!should_dismiss_on_blur(
+    fn menubar_show_grace_lasts_five_seconds() {
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_millis(10),
+            Duration::from_secs(3),
+            Duration::from_millis(4999),
+        ] {
+            assert!(!should_dismiss_on_blur(
+                true,
+                false,
+                false,
+                false,
+                false,
+                Some(elapsed)
+            ));
+        }
+        assert!(should_dismiss_on_blur(
             true,
             false,
             false,
-            Some(Duration::from_millis(10))
+            false,
+            false,
+            Some(Duration::from_secs(5)),
+        ));
+    }
+
+    #[test]
+    fn menubar_cursor_and_file_drag_defer_dismissal_until_both_end() {
+        let elapsed = Some(Duration::from_secs(6));
+        for (cursor_over, dragging) in [(true, false), (false, true), (true, true)] {
+            assert!(!should_dismiss_on_blur(
+                true,
+                false,
+                false,
+                cursor_over,
+                dragging,
+                elapsed,
+            ));
+        }
+        assert!(should_dismiss_on_blur(
+            true, false, false, false, false, elapsed,
         ));
     }
 
@@ -522,26 +667,22 @@ mod window_tests {
             true,
             false,
             true,
-            Some(PANEL_BLUR_GUARD * 2),
+            false,
+            false,
+            Some(Duration::from_secs(7)),
         ));
     }
 
     #[test]
-    fn menubar_panel_starts_pinned_and_does_not_dismiss_on_blur() {
+    fn menubar_panel_starts_unpinned() {
         let state = PanelWindowState::default();
-        assert!(state.pinned.load(Ordering::Relaxed));
-        assert!(!should_dismiss_on_blur(
-            true,
-            false,
-            state.pinned.load(Ordering::Relaxed),
-            Some(PANEL_BLUR_GUARD * 2),
-        ));
+        assert!(!state.pinned.load(Ordering::Relaxed));
     }
 
     #[test]
     fn menubar_pin_survives_show_and_hide_during_the_session() {
         let state = PanelWindowState::default();
-        assert!(state.pinned.load(Ordering::Relaxed));
+        state.pinned.store(true, Ordering::Relaxed);
         state.set_shown_at(Some(Instant::now()));
         state.set_shown_at(None);
         state.set_shown_at(Some(Instant::now()));
@@ -550,15 +691,89 @@ mod window_tests {
             true,
             false,
             state.pinned.load(Ordering::Relaxed),
-            Some(PANEL_BLUR_GUARD),
+            false,
+            false,
+            Some(Duration::from_secs(6)),
         ));
         state.pinned.store(false, Ordering::Relaxed);
         assert!(should_dismiss_on_blur(
             true,
             false,
             state.pinned.load(Ordering::Relaxed),
-            Some(PANEL_BLUR_GUARD),
+            false,
+            false,
+            Some(Duration::from_secs(6)),
         ));
+    }
+
+    #[test]
+    fn menubar_stale_rechecks_cannot_target_a_reopened_panel() {
+        let state = PanelWindowState::default();
+        let first_show = Instant::now();
+        state.set_shown_at(Some(first_show));
+        assert!(state.is_current_show(first_show));
+        state.pinned.store(true, Ordering::Relaxed);
+        state.set_shown_at(None);
+        assert!(!state.is_current_show(first_show));
+        let next_show = first_show + Duration::from_secs(1);
+        state.set_shown_at(Some(next_show));
+        assert!(!state.is_current_show(first_show));
+        assert!(state.is_current_show(next_show));
+        assert!(!should_dismiss_on_blur(
+            true,
+            false,
+            false,
+            false,
+            false,
+            Some(Duration::ZERO),
+        ));
+    }
+
+    #[test]
+    fn menubar_file_drag_enter_over_leave_and_drop_update_activity() {
+        let position = tauri::PhysicalPosition::new(10.0, 20.0);
+        assert_eq!(
+            file_drag_active(&tauri::DragDropEvent::Enter {
+                paths: vec![],
+                position
+            }),
+            Some(true),
+        );
+        assert_eq!(
+            file_drag_active(&tauri::DragDropEvent::Over { position }),
+            Some(true)
+        );
+        assert_eq!(file_drag_active(&tauri::DragDropEvent::Leave), Some(false));
+        assert_eq!(
+            file_drag_active(&tauri::DragDropEvent::Drop {
+                paths: vec![],
+                position
+            }),
+            Some(false),
+        );
+        let state = PanelWindowState::default();
+        state.dragging.store(true, Ordering::Relaxed);
+        state.set_shown_at(None);
+        assert!(!state.dragging.load(Ordering::Relaxed));
+        state.dragging.store(true, Ordering::Relaxed);
+        state.set_shown_at(Some(Instant::now()));
+        assert!(!state.dragging.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn menubar_cursor_hit_test_uses_native_frame_coordinates() {
+        let frame = PanelRect {
+            x: -500.0,
+            y: -700.0,
+            width: 320.0,
+            height: 404.0,
+        };
+        assert!(frame.contains(-500.0, -700.0));
+        assert!(frame.contains(-300.0, -500.0));
+        assert!(!frame.contains(-501.0, -500.0));
+        assert!(!frame.contains(-180.0, -500.0));
+        assert!(!frame.contains(-300.0, -701.0));
+        assert!(!frame.contains(-300.0, -296.0));
     }
 
     #[test]
@@ -581,11 +796,19 @@ mod window_tests {
 
     #[test]
     fn menubar_blur_after_guard_dismisses_only_an_unfocused_visible_panel() {
-        let elapsed = Some(PANEL_BLUR_GUARD);
-        assert!(should_dismiss_on_blur(true, false, false, elapsed));
-        assert!(!should_dismiss_on_blur(true, true, false, elapsed));
-        assert!(!should_dismiss_on_blur(false, false, false, elapsed));
-        assert!(!should_dismiss_on_blur(true, false, false, None));
+        let elapsed = Some(PANEL_SHOW_GRACE);
+        assert!(should_dismiss_on_blur(
+            true, false, false, false, false, elapsed
+        ));
+        assert!(!should_dismiss_on_blur(
+            true, true, false, false, false, elapsed
+        ));
+        assert!(!should_dismiss_on_blur(
+            false, false, false, false, false, elapsed
+        ));
+        assert!(!should_dismiss_on_blur(
+            true, false, false, false, false, None
+        ));
     }
 
     #[test]
