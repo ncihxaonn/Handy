@@ -15,6 +15,7 @@ use serde::Serialize;
 use specta::Type;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{
@@ -47,15 +48,33 @@ const MEETING_BINDING_ID: &str = "menubar_meeting";
 const STATUS_EVENT: &str = "panel-status-changed";
 const PANEL_BLUR_GUARD: Duration = Duration::from_millis(400);
 
-struct PanelWindowState(Mutex<Option<Instant>>);
+struct PanelWindowState {
+    shown_at: Mutex<Option<Instant>>,
+    pinned: AtomicBool,
+}
+
+impl Default for PanelWindowState {
+    fn default() -> Self {
+        Self {
+            shown_at: Mutex::new(None),
+            pinned: AtomicBool::new(true),
+        }
+    }
+}
 
 impl PanelWindowState {
     fn shown_at(&self) -> Option<Instant> {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+        *self
+            .shown_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn set_shown_at(&self, shown_at: Option<Instant>) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = shown_at;
+        *self
+            .shown_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = shown_at;
     }
 }
 
@@ -90,8 +109,18 @@ fn calculate_panel_position(icon: PanelRect, work_area: PanelRect) -> (f64, f64)
     (x, y)
 }
 
-fn should_dismiss_on_blur(visible: bool, focused: bool, shown_elapsed: Option<Duration>) -> bool {
-    visible && !focused && shown_elapsed.is_some_and(|elapsed| elapsed >= PANEL_BLUR_GUARD)
+fn should_dismiss_on_blur(
+    visible: bool,
+    focused: bool,
+    pinned: bool,
+    _cursor_over: bool,
+    _dragging: bool,
+    shown_elapsed: Option<Duration>,
+) -> bool {
+    visible
+        && !focused
+        && !pinned
+        && shown_elapsed.is_some_and(|elapsed| elapsed >= PANEL_BLUR_GUARD)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Type)]
@@ -143,7 +172,7 @@ fn fail(app: &AppHandle, message: String) {
 /* ---------- window --------------------------------------------------------- */
 
 pub fn create_panel(app: &AppHandle) {
-    app.manage(PanelWindowState(Mutex::new(None)));
+    app.manage(PanelWindowState::default());
     let result = WebviewWindowBuilder::new(
         app,
         PANEL_LABEL,
@@ -217,6 +246,20 @@ pub fn create_panel(app: &AppHandle) {
                     if !focused {
                         handle_panel_blur(&handle);
                     }
+                } else if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) =
+                    event
+                {
+                    info!(
+                        "Menubar panel file drop: files={} visible={:?} focused={:?} pinned={}",
+                        paths.len(),
+                        handle.is_visible(),
+                        handle.is_focused(),
+                        handle
+                            .app_handle()
+                            .state::<PanelWindowState>()
+                            .pinned
+                            .load(Ordering::Relaxed)
+                    );
                 }
             });
             info!(
@@ -231,17 +274,22 @@ pub fn create_panel(app: &AppHandle) {
 }
 
 fn handle_panel_blur(window: &WebviewWindow) {
-    let shown_at = window.app_handle().state::<PanelWindowState>().shown_at();
+    let state = window.app_handle().state::<PanelWindowState>();
+    let shown_at = state.shown_at();
+    let pinned = state.pinned.load(Ordering::Relaxed);
     let visible = window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
     let elapsed = shown_at.map(|time| time.elapsed());
     info!(
-        "Menubar panel blur: visible={} focused={} shown_ms={:?}",
+        "Menubar panel blur: visible={} focused={} pinned={} shown_ms={:?}",
         visible,
         focused,
+        pinned,
         elapsed.map(|time| time.as_millis())
     );
-    if should_dismiss_on_blur(visible, focused, elapsed) {
+    if pinned {
+        info!("Menubar panel blur: ignored while pinned");
+    } else if should_dismiss_on_blur(visible, focused, pinned, false, false, elapsed) {
         info!("Menubar panel blur: hiding");
         hide_panel(window.app_handle());
     } else if visible && !focused && elapsed.is_some_and(|time| time < PANEL_BLUR_GUARD) {
@@ -422,6 +470,31 @@ fn hide_panel(app: &AppHandle) {
 
 #[tauri::command]
 #[specta::specta]
+pub fn get_panel_pinned(app: AppHandle) -> bool {
+    app.state::<PanelWindowState>()
+        .pinned
+        .load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_panel_pinned(app: AppHandle, pinned: bool) -> bool {
+    app.state::<PanelWindowState>()
+        .pinned
+        .store(pinned, Ordering::Relaxed);
+    info!("Menubar panel pin changed: pinned={}", pinned);
+    pinned
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn hide_menubar_panel(app: AppHandle) {
+    info!("Menubar panel dismiss requested");
+    hide_panel(&app);
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn panel_frontend_ready(window: WebviewWindow) {
     if window.label() == PANEL_LABEL {
         info!("Menubar panel frontend ready: label={}", PANEL_LABEL);
@@ -438,7 +511,53 @@ mod window_tests {
         assert!(!should_dismiss_on_blur(
             true,
             false,
+            false,
             Some(Duration::from_millis(10))
+        ));
+    }
+
+    #[test]
+    fn menubar_pinned_panel_stays_visible_when_finder_takes_focus() {
+        assert!(!should_dismiss_on_blur(
+            true,
+            false,
+            true,
+            Some(PANEL_BLUR_GUARD * 2),
+        ));
+    }
+
+    #[test]
+    fn menubar_panel_starts_pinned_and_does_not_dismiss_on_blur() {
+        let state = PanelWindowState::default();
+        assert!(state.pinned.load(Ordering::Relaxed));
+        assert!(!should_dismiss_on_blur(
+            true,
+            false,
+            state.pinned.load(Ordering::Relaxed),
+            Some(PANEL_BLUR_GUARD * 2),
+        ));
+    }
+
+    #[test]
+    fn menubar_pin_survives_show_and_hide_during_the_session() {
+        let state = PanelWindowState::default();
+        assert!(state.pinned.load(Ordering::Relaxed));
+        state.set_shown_at(Some(Instant::now()));
+        state.set_shown_at(None);
+        state.set_shown_at(Some(Instant::now()));
+        assert!(state.pinned.load(Ordering::Relaxed));
+        assert!(!should_dismiss_on_blur(
+            true,
+            false,
+            state.pinned.load(Ordering::Relaxed),
+            Some(PANEL_BLUR_GUARD),
+        ));
+        state.pinned.store(false, Ordering::Relaxed);
+        assert!(should_dismiss_on_blur(
+            true,
+            false,
+            state.pinned.load(Ordering::Relaxed),
+            Some(PANEL_BLUR_GUARD),
         ));
     }
 
@@ -463,10 +582,10 @@ mod window_tests {
     #[test]
     fn menubar_blur_after_guard_dismisses_only_an_unfocused_visible_panel() {
         let elapsed = Some(PANEL_BLUR_GUARD);
-        assert!(should_dismiss_on_blur(true, false, elapsed));
-        assert!(!should_dismiss_on_blur(true, true, elapsed));
-        assert!(!should_dismiss_on_blur(false, false, elapsed));
-        assert!(!should_dismiss_on_blur(true, false, None));
+        assert!(should_dismiss_on_blur(true, false, false, elapsed));
+        assert!(!should_dismiss_on_blur(true, true, false, elapsed));
+        assert!(!should_dismiss_on_blur(false, false, false, elapsed));
+        assert!(!should_dismiss_on_blur(true, false, false, None));
     }
 
     #[test]

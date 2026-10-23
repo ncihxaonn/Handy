@@ -8,6 +8,8 @@
   --hp-accent-2: #e2336f;
   --hp-rec: #e5484d;
   --hp-hover: rgba(15, 15, 20, 0.05);
+  --hp-pin-bg: #fce2ec;
+  --hp-pin-text: #ad1b52;
   --hp-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.14);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI",
@@ -25,6 +27,8 @@
     --hp-text: #f3f3f5;
     --hp-muted: #9a9aa4;
     --hp-hover: rgba(255, 255, 255, 0.07);
+    --hp-pin-bg: #4d283b;
+    --hp-pin-text: #ff8cb6;
     --hp-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.14);
   }
 }
@@ -64,6 +68,7 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 0 2px;
 }
 
@@ -98,6 +103,12 @@ button:disabled {
   text-overflow: ellipsis;
 }
 
+.hp-header-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .hp-icon-btn {
   display: grid;
   place-items: center;
@@ -113,6 +124,12 @@ button:disabled {
 .hp-icon-btn:hover {
   background: var(--hp-hover);
   color: var(--hp-text);
+}
+
+.hp-icon-btn[aria-pressed="true"] {
+  background: var(--hp-pin-bg);
+  color: var(--hp-pin-text);
+  box-shadow: inset 0 0 0 1px currentColor;
 }
 
 /* record button */

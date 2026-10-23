@@ -671,6 +671,8 @@
     "lastTranscript": "Last transcript",
     "noTranscript": "Your latest transcript will appear here.",
     "settings": "Settings",
+    "pin": "Pin panel",
+    "unpin": "Unpin panel",
     "openApp": "Open Handy",
     "discard": "Discard",
     "quit": "Quit",

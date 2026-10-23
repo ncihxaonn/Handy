@@ -11,6 +11,7 @@ import {
   FileAudio,
   Loader2,
   Mic,
+  Pin,
   Power,
   Settings,
   Square,
@@ -68,6 +69,9 @@ export default function MenubarPanel() {
   const [now, setNow] = useState(Date.now());
   const [lastTranscript, setLastTranscript] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string | null>(null);
+  const [pinned, setPinned] = useState(true);
+  const [pinPending, setPinPending] = useState(false);
+  const pinRevision = useRef(0);
   const [dragging, setDragging] = useState(false);
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
@@ -82,14 +86,17 @@ export default function MenubarPanel() {
   }, []);
 
   const refresh = useCallback(async () => {
-    const [nextStatus, last, model] = await Promise.all([
+    const revision = pinRevision.current;
+    const [nextStatus, last, model, nextPinned] = await Promise.all([
       invoke<PanelStatus>("get_panel_status"),
       invoke<string | null>("get_last_transcript"),
       invoke<string | null>("get_selected_model_name"),
+      invoke<boolean>("get_panel_pinned"),
     ]);
     setStatus(nextStatus);
     setLastTranscript(last);
     setModelName(model);
+    if (pinRevision.current === revision) setPinned(nextPinned);
   }, []);
 
   const runAction = useCallback(
@@ -102,6 +109,30 @@ export default function MenubarPanel() {
     },
     [showNotice],
   );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        void runAction("hide_menubar_panel");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [runAction]);
+
+  const onTogglePin = async () => {
+    if (pinPending) return;
+    setPinPending(true);
+    pinRevision.current += 1;
+    try {
+      setPinned(await invoke<boolean>("set_panel_pinned", { pinned: !pinned }));
+    } catch (err) {
+      showNotice({ kind: "error", text: String(err) });
+    } finally {
+      setPinPending(false);
+    }
+  };
 
   const transcribeFile = useCallback(
     (path: string) => runAction("transcribe_panel_file", { path }),
@@ -193,14 +224,26 @@ export default function MenubarPanel() {
           <span className="hp-title">{"Handy"}</span>
           {modelName && <span className="hp-chip">{modelName}</span>}
         </div>
-        <button
-          className="hp-icon-btn"
-          onClick={() => runAction("open_main_window_from_panel")}
-          title={t("panel.settings")}
-          aria-label={t("panel.settings")}
-        >
-          <Settings size={16} />
-        </button>
+        <div className="hp-header-actions">
+          <button
+            className="hp-icon-btn"
+            onClick={onTogglePin}
+            disabled={pinPending}
+            aria-pressed={pinned === true}
+            title={t(pinned ? "panel.unpin" : "panel.pin")}
+            aria-label={t(pinned ? "panel.unpin" : "panel.pin")}
+          >
+            <Pin size={16} aria-hidden />
+          </button>
+          <button
+            className="hp-icon-btn"
+            onClick={() => runAction("open_main_window_from_panel")}
+            title={t("panel.settings")}
+            aria-label={t("panel.settings")}
+          >
+            <Settings size={16} />
+          </button>
+        </div>
       </header>
 
       <button

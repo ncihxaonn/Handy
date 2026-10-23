@@ -671,6 +671,8 @@
     "lastTranscript": "上一次轉寫",
     "noTranscript": "最新的轉寫內容會顯示在這裡。",
     "settings": "設定",
+    "pin": "釘選面板",
+    "unpin": "取消釘選面板",
     "openApp": "開啟 Handy",
     "discard": "放棄",
     "quit": "退出",
