@@ -14,6 +14,8 @@
     "advanced": "Advanced",
     "postProcessing": "Post Process",
     "history": "History",
+    "meetingRecording": "Meeting Recording",
+    "fileTranscription": "File Transcription",
     "debug": "Debug",
     "about": "About"
   },
@@ -633,6 +635,25 @@
   "overlay": {
     "transcribing": "Transcribing...",
     "processing": "Processing..."
+  },
+  "transcription": {
+    "ready": "Ready",
+    "recording": "Recording",
+    "done": "Done",
+    "error": "Error: {{error}}",
+    "transcript": "Transcript",
+    "elapsedTime": "Recording time",
+    "savedToHistory": "Saved to History.",
+    "copyFailed": "Could not copy transcript: {{error}}"
+  },
+  "meetingRecording": {
+    "stopRecording": "Stop Recording"
+  },
+  "fileTranscription": {
+    "drop": "Drop an audio or video file here",
+    "chooseFile": "Choose file",
+    "mediaFiles": "Audio and video",
+    "unsupportedFile": "Choose an audio or video file."
   },
   "panel": {
     "startRecording": "Start Recording",

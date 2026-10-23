@@ -1,6 +1,17 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { Cog, FlaskConical, History, Info, Sparkles, Cpu } from "lucide-react";
+import {
+  Cog,
+  FlaskConical,
+  History,
+  Info,
+  Sparkles,
+  Cpu,
+  Mic,
+  FileAudio,
+} from "lucide-react";
+import { MeetingRecording } from "./transcription/MeetingRecording";
+import { FileTranscription } from "./transcription/FileTranscription";
 import HandyTextLogo from "./icons/HandyTextLogo";
 import HandyHand from "./icons/HandyHand";
 import { useSettings } from "../hooks/useSettings";
@@ -54,6 +65,18 @@ export const SECTIONS_CONFIG = {
     labelKey: "sidebar.history",
     icon: History,
     component: HistorySettings,
+    enabled: () => true,
+  },
+  meetingRecording: {
+    labelKey: "sidebar.meetingRecording",
+    icon: Mic,
+    component: MeetingRecording,
+    enabled: () => true,
+  },
+  fileTranscription: {
+    labelKey: "sidebar.fileTranscription",
+    icon: FileAudio,
+    component: FileTranscription,
     enabled: () => true,
   },
   postprocessing: {
@@ -112,7 +135,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
             >
               <Icon width={24} height={24} className="shrink-0" />
               <p
-                className="text-sm font-medium truncate"
+                className={`text-sm font-medium ${
+                  section.id === "meetingRecording" ||
+                  section.id === "fileTranscription"
+                    ? "leading-5 text-start"
+                    : "truncate"
+                }`}
                 title={t(section.labelKey)}
               >
                 {t(section.labelKey)}

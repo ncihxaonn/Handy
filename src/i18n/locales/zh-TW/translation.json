@@ -14,6 +14,8 @@
     "advanced": "進階",
     "postProcessing": "後處理",
     "history": "歷史紀錄",
+    "meetingRecording": "會議錄音",
+    "fileTranscription": "檔案轉寫",
     "debug": "偵錯",
     "about": "關於"
   },
@@ -633,6 +635,25 @@
   },
   "whatsNew": {
     "title": "Handy v{{version}} 新功能"
+  },
+  "transcription": {
+    "ready": "就緒",
+    "recording": "錄音中",
+    "done": "完成",
+    "error": "錯誤：{{error}}",
+    "transcript": "轉寫內容",
+    "elapsedTime": "錄音時長",
+    "savedToHistory": "已儲存至歷史紀錄。",
+    "copyFailed": "無法複製轉寫內容：{{error}}"
+  },
+  "meetingRecording": {
+    "stopRecording": "停止錄音"
+  },
+  "fileTranscription": {
+    "drop": "將音訊或影片檔案拖到這裡",
+    "chooseFile": "選擇檔案",
+    "mediaFiles": "音訊和影片",
+    "unsupportedFile": "請選擇音訊或影片檔案。"
   },
   "panel": {
     "startRecording": "開始錄音",
