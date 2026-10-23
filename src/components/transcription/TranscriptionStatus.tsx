@@ -34,6 +34,9 @@ export function TranscriptionStatus({
         : status.file_name
           ? t("panel.transcribingFile", { name: status.file_name })
           : t("panel.transcribing");
+    if (activeJob === job && status.progress) {
+      message += ` ${status.progress.completed} / ${status.progress.total}`;
+    }
   } else {
     message = t(
       transcripts[job] !== null ? "transcription.done" : "transcription.ready",

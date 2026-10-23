@@ -9,6 +9,7 @@ export interface PanelStatus {
   started_at_ms: number | null;
   file_name: string | null;
   error: string | null;
+  progress?: { completed: number; total: number } | null;
 }
 
 interface PanelBackend {
@@ -152,11 +153,17 @@ export const createPanelTranscriptionSession = (
     if (
       isStarting
         ? state.status.phase !== "idle"
-        : state.status.phase !== "recording"
+        : command === "cancel_panel_recording"
+          ? state.status.phase === "idle"
+          : state.status.phase !== "recording"
     ) {
       return;
     }
-    const job = command === "transcribe_panel_file" ? "file" : "meeting";
+    const job = isStarting
+      ? command === "transcribe_panel_file"
+        ? "file"
+        : "meeting"
+      : (state.activeJob ?? "meeting");
     useStore.setState({
       pending: true,
       errors: { ...state.errors, [job]: null },
@@ -168,8 +175,8 @@ export const createPanelTranscriptionSession = (
       if (revision === beforeRequest) updateStatus(status);
       if (command === "cancel_panel_recording") {
         useStore.setState((current) => ({
-          activeJob: null,
-          transcripts: { ...current.transcripts, meeting: null },
+          activeJob: current.activeJob === job ? null : current.activeJob,
+          transcripts: { ...current.transcripts, [job]: null },
         }));
       }
     } catch (error) {

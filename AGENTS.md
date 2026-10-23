@@ -215,3 +215,23 @@ See the [Troubleshooting](README.md#troubleshooting) section in README.md.
 - **Full contributor workflow:** [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Commits:** Use conventional commit prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`). Focus the message on _why_, not _what_.
+
+## Personal fork releases
+
+- Target only `ncihxaonn/Handy` using the isolated Personal GitHub profile. The
+  updater endpoint and public key in `src-tauri/tauri.conf.json` belong to this
+  fork, not the upstream application.
+- The dedicated signing pair is stored in macOS Keychain under service
+  `personal.ncihxaonn.Handy.updater`, account `ncihxaonn/Handy`. Never write the
+  private key to a repository file, Hermes profile, command argument, or log.
+- Use `python3 scripts/personal-updater.py check` to verify the approved
+  Personal scope and public-key match. Use its `build` action to inject the
+  signing key directly into the Tauri build process. The `setup` action creates
+  the key only if absent and uploads the repository-scoped Actions secret;
+  require explicit user approval for setup or key rotation.
+- Future `personal-v<version>` tags run the ARM64-only Personal release workflow
+  without a Rust cache. It creates a signed draft and `latest.json`. Publish only
+  after its checks pass. A branch push alone is not a published app update.
+- Verify the published manifest, asset signature, and exact source commit
+  before installing. Preserve user data and a rollback app copy. Local ad-hoc
+  signing is not Apple notarization.

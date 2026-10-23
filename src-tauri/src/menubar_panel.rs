@@ -140,6 +140,12 @@ pub enum PanelPhase {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Type)]
+pub struct TranscriptionProgress {
+    pub completed: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Type)]
 pub struct PanelStatus {
     pub phase: PanelPhase,
     /// Unix ms when the current recording started.
@@ -148,6 +154,7 @@ pub struct PanelStatus {
     pub file_name: Option<String>,
     /// Error from the most recent job, cleared when a new one starts.
     pub error: Option<String>,
+    pub progress: Option<TranscriptionProgress>,
 }
 
 /// Tauri managed state for the panel's single in-flight job.
@@ -162,6 +169,29 @@ impl PanelState {
 fn set_status(app: &AppHandle, status: PanelStatus) {
     *app.state::<PanelState>().0.lock().unwrap() = status.clone();
     let _ = app.emit(STATUS_EVENT, status);
+}
+
+pub fn update_transcription_progress(
+    app: &AppHandle,
+    completed: usize,
+    total: usize,
+    cancel: &transcribe_cpp::CancelToken,
+) {
+    let Some(state) = app.try_state::<PanelState>() else {
+        return;
+    };
+    let mut status = state.0.lock().unwrap();
+    if cancel.is_cancelled() || !matches!(status.phase, PanelPhase::Transcribing) {
+        return;
+    }
+    status.progress = Some(TranscriptionProgress { completed, total });
+    let _ = app.emit(STATUS_EVENT, status.clone());
+}
+
+pub fn reset_transcription_status(app: &AppHandle) {
+    if app.try_state::<PanelState>().is_some() {
+        set_status(app, PanelStatus::default());
+    }
 }
 
 fn fail(app: &AppHandle, message: String) {
@@ -892,14 +922,41 @@ mod window_tests {
         let endpoints = config["plugins"]["updater"]["endpoints"]
             .as_array()
             .unwrap();
-        assert!(endpoints.is_empty());
+        assert_eq!(
+            endpoints,
+            &vec![serde_json::json!(
+                "https://github.com/ncihxaonn/Handy/releases/latest/download/latest.json"
+            )]
+        );
+        assert_eq!(
+            config["plugins"]["updater"]["pubkey"],
+            "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM0RjYxMEEzMkMxNTYxNUYKUldSZllSVXNveEQyTkw2UXg1blVYNWtZYitwM3VyNTNjamxEZi9ZTi83d0FHTDJpWEFPT0s3REYK"
+        );
+    }
+
+    #[test]
+    fn only_the_main_window_has_updater_permission() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/desktop.json")).unwrap();
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert!(capability["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("updater:default")));
     }
 }
 
 /* ---------- shared output -------------------------------------------------- */
 
 /// Saves the samples + transcription to history and copies the text.
-async fn finish_transcription(app: &AppHandle, samples: Vec<f32>) {
+async fn finish_transcription(
+    app: &AppHandle,
+    samples: Vec<f32>,
+    cancel: transcribe_cpp::CancelToken,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
     let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
     let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
 
@@ -910,8 +967,16 @@ async fn finish_transcription(app: &AppHandle, samples: Vec<f32>) {
         crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
     });
 
-    let result = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples)).await;
+    let engine_cancel = cancel.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        tm.transcribe_with_cancel(samples, engine_cancel)
+    })
+    .await;
     let wav_saved = matches!(wav_saved.await, Ok(Ok(())));
+
+    if cancel.is_cancelled() {
+        return;
+    }
 
     let transcription = match result {
         Ok(Ok(text)) => text,
@@ -920,6 +985,10 @@ async fn finish_transcription(app: &AppHandle, samples: Vec<f32>) {
     };
 
     let processed = process_transcription_output(app, &transcription, false).await;
+
+    if cancel.is_cancelled() {
+        return;
+    }
 
     if wav_saved {
         if let Err(e) = hm.save_entry(file_name, transcription, false, None, None) {
@@ -999,9 +1068,12 @@ pub fn stop_panel_recording(app: AppHandle) -> Result<(), String> {
         },
     );
 
+    let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
+    let generation = rm.cancel_generation();
+    let cancel = app
+        .state::<Arc<TranscriptionManager>>()
+        .cancellation_token();
     tauri::async_runtime::spawn(async move {
-        let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
-        let generation = rm.cancel_generation();
         let samples = tauri::async_runtime::spawn_blocking(move || {
             rm.stop_recording(MEETING_BINDING_ID, generation)
         })
@@ -1009,8 +1081,13 @@ pub fn stop_panel_recording(app: AppHandle) -> Result<(), String> {
         .ok()
         .flatten();
 
+        if cancel.is_cancelled() {
+            return;
+        }
         match samples {
-            Some(samples) if !samples.is_empty() => finish_transcription(&app, samples).await,
+            Some(samples) if !samples.is_empty() => {
+                finish_transcription(&app, samples, cancel).await
+            }
             _ => fail(&app, "The recording contains no audio.".to_string()),
         }
     });
@@ -1021,7 +1098,6 @@ pub fn stop_panel_recording(app: AppHandle) -> Result<(), String> {
 #[specta::specta]
 pub fn cancel_panel_recording(app: AppHandle) {
     crate::utils::cancel_current_operation(&app);
-    set_status(&app, PanelStatus::default());
 }
 
 #[tauri::command]
@@ -1047,13 +1123,19 @@ pub fn transcribe_panel_file(app: AppHandle, path: String) -> Result<(), String>
         },
     );
 
+    let cancel = app
+        .state::<Arc<TranscriptionManager>>()
+        .cancellation_token();
     tauri::async_runtime::spawn(async move {
         let decoded = tauri::async_runtime::spawn_blocking(move || decode_to_samples(&source))
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
+        if cancel.is_cancelled() {
+            return;
+        }
         match decoded {
-            Ok(samples) if !samples.is_empty() => finish_transcription(&app, samples).await,
+            Ok(samples) if !samples.is_empty() => finish_transcription(&app, samples, cancel).await,
             Ok(_) => fail(&app, "The file contains no audio.".to_string()),
             Err(e) => fail(&app, e),
         }

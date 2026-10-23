@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod constants;
 pub mod text;
+pub mod transcription_chunks;
 pub mod utils;
 pub mod vad;
 

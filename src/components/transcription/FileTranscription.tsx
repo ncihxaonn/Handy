@@ -150,6 +150,16 @@ export function FileTranscription() {
         </Button>
       </div>
       <TranscriptionStatus job="file" error={localError} />
+      {transcribing && (
+        <Button
+          variant="ghost"
+          disabled={pending}
+          onClick={() => runPanelCommand("cancel_panel_recording")}
+          className="focus-visible:ring-2 focus-visible:ring-logo-primary"
+        >
+          {t("common.cancel")}
+        </Button>
+      )}
       <TranscriptResult transcript={transcripts.file} />
     </div>
   );

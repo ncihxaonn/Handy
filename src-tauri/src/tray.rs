@@ -233,7 +233,7 @@ pub fn update_tray_menu(app: &AppHandle, locale: Option<&str>) {
         app,
         "check_updates",
         &strings.check_updates,
-        false,
+        true,
         None::<&str>,
     )
     .expect("failed to create check updates item");

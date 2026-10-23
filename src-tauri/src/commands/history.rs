@@ -84,10 +84,14 @@ pub async fn retry_history_entry_transcription(
     transcription_manager.initiate_model_load();
 
     let tm = Arc::clone(&transcription_manager);
-    let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
-        .await
-        .map_err(|e| format!("Transcription task panicked: {}", e))?
-        .map_err(|e| e.to_string())?;
+    let cancel = tm.cancellation_token();
+    let engine_cancel = cancel.clone();
+    let transcription = tauri::async_runtime::spawn_blocking(move || {
+        tm.transcribe_with_cancel(samples, engine_cancel)
+    })
+    .await
+    .map_err(|e| format!("Transcription task panicked: {}", e))?
+    .map_err(|e| e.to_string())?;
 
     if transcription.is_empty() {
         return Err("Recording contains no speech".to_string());
@@ -95,6 +99,9 @@ pub async fn retry_history_entry_transcription(
 
     let processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+    if cancel.is_cancelled() {
+        return Err("Transcription cancelled".into());
+    }
     history_manager
         .update_transcription(
             id,

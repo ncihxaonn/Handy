@@ -1,3 +1,8 @@
+use crate::audio_toolkit::transcription_chunks::{
+    chunk_sample_limit, chunks_at_silences, ensure_not_cancelled, needs_chunking, plan_vad_chunks,
+    transcribe_chunks,
+};
+use crate::audio_toolkit::SileroVad;
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
@@ -17,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_specta::Event;
 use transcribe_cpp::{
-    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, StreamOptions, Task,
-    WhisperRunOptions,
+    Backend, CancelToken, Feature, Model, ModelOptions, RunExtension, RunOptions, Session,
+    StreamOptions, Task, WhisperRunOptions,
 };
 use transcribe_rs::{
     onnx::{
@@ -237,6 +242,8 @@ impl Drop for StreamWorkerGuard {
 #[derive(Clone)]
 pub struct TranscriptionManager {
     engine: Arc<Mutex<Option<LoadedEngine>>>,
+    batch_cancel: Arc<Mutex<CancelToken>>,
+    batch_active: Arc<AtomicBool>,
     model_manager: Arc<ModelManager>,
     app_handle: AppHandle,
     current_model_id: Arc<Mutex<Option<String>>>,
@@ -273,6 +280,8 @@ impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
         let manager = Self {
             engine: Arc::new(Mutex::new(None)),
+            batch_cancel: Arc::new(Mutex::new(CancelToken::new())),
+            batch_active: Arc::new(AtomicBool::new(false)),
             model_manager,
             app_handle: app_handle.clone(),
             current_model_id: Arc::new(Mutex::new(None)),
@@ -321,6 +330,9 @@ impl TranscriptionManager {
                         .is_some_and(|a| a.is_recording());
                     if is_recording {
                         manager_cloned.touch_activity();
+                        continue;
+                    }
+                    if manager_cloned.batch_active.load(Ordering::Acquire) {
                         continue;
                     }
 
@@ -374,7 +386,9 @@ impl TranscriptionManager {
     pub fn is_model_loaded(&self) -> bool {
         // The engine may be leased out to the streaming worker (taken out of
         // the mutex). It's still loaded, just in use, so report true.
-        self.lock_engine().is_some() || self.active_engine_lease.load(Ordering::Acquire) != 0
+        self.lock_engine().is_some()
+            || self.active_engine_lease.load(Ordering::Acquire) != 0
+            || self.batch_active.load(Ordering::Acquire)
     }
 
     /// Accelerator changes should not disturb the current transcription. Mark
@@ -449,6 +463,7 @@ impl TranscriptionManager {
     pub fn maybe_unload_immediately(&self, context: &str) {
         let settings = get_settings(&self.app_handle);
         if settings.model_unload_timeout == ModelUnloadTimeout::Immediately
+            && !self.batch_active.load(Ordering::Acquire)
             && self.is_model_loaded()
         {
             info!("Immediately unloading model after {}", context);
@@ -1110,6 +1125,22 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        self.transcribe_with_cancel(audio, self.cancellation_token())
+    }
+
+    pub fn cancellation_token(&self) -> CancelToken {
+        self.batch_cancel.lock().unwrap().clone()
+    }
+
+    pub fn cancel_transcription(&self) {
+        let mut token = self.batch_cancel.lock().unwrap();
+        token.cancel();
+        *token = CancelToken::new();
+    }
+
+    pub fn transcribe_with_cancel(&self, audio: Vec<f32>, cancel: CancelToken) -> Result<String> {
+        let is_cancelled = || cancel.is_cancelled();
+        ensure_not_cancelled(&is_cancelled)?;
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1182,6 +1213,21 @@ impl TranscriptionManager {
         // with INVALID_ARG, so the whisper extension must be gated on the
         // arch, not on the feature (see #1601).
         let mut model_is_whisper = false;
+
+        if self
+            .batch_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            anyhow::bail!("A transcription is still finishing. Please try again shortly.");
+        }
+        struct BatchGuard<'a>(&'a AtomicBool);
+        impl Drop for BatchGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let batch_guard = BatchGuard(&self.batch_active);
 
         // Perform transcription with the appropriate engine.
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
@@ -1267,12 +1313,71 @@ impl TranscriptionManager {
                             run_options.family.is_some()
                         );
 
-                        session
-                            .run(&audio, &run_options)
-                            .map(|t| t.text)
-                            .map_err(|e| {
-                                anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
-                            })
+                        ensure_not_cancelled(&is_cancelled)?;
+                        let max_audio_ms = session.model().capabilities().max_audio_ms;
+                        let chunked = needs_chunking(audio.len(), max_audio_ms);
+                        let chunks = if chunked {
+                            let limit = chunk_sample_limit(max_audio_ms)?;
+                            let planned: Result<_> = (|| {
+                                let path = self
+                                    .app_handle
+                                    .path()
+                                    .resource_dir()?
+                                    .join("resources/models/silero_vad_v4.onnx");
+                                let mut vad = SileroVad::new(path, 0.5)?;
+                                plan_vad_chunks(&audio, limit, &mut vad, &is_cancelled)
+                            })();
+                            ensure_not_cancelled(&is_cancelled)?;
+                            match planned {
+                                Ok(chunks) => chunks,
+                                Err(error) => {
+                                    warn!(
+                                        "VAD chunk planning failed: {}; using bounded hard cuts",
+                                        error
+                                    );
+                                    chunks_at_silences(audio.len(), limit, &[])?
+                                }
+                            }
+                        } else {
+                            vec![0..audio.len()]
+                        };
+                        if chunked {
+                            info!("Transcribing {:.2}s of audio in {} sequential chunks (model max_audio_ms={}, longest_chunk={:.3}s)",
+                                audio.len() as f64 / 16_000.0, chunks.len(), max_audio_ms,
+                                chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0) as f64 / 16_000.0);
+                        }
+                        session.set_cancel_token(&cancel);
+                        let result = transcribe_chunks(
+                            &audio,
+                            &chunks,
+                            max_audio_ms,
+                            &is_cancelled,
+                            |samples| {
+                                session
+                                    .run(samples, &run_options)
+                                    .map(|t| t.text)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "transcribe-cpp transcription failed: {}",
+                                            e
+                                        )
+                                    })
+                            },
+                            |completed, total| {
+                                self.touch_activity();
+                                if chunked && !cancel.is_cancelled() {
+                                    info!("Transcription chunk progress: {}/{}", completed, total);
+                                    crate::menubar_panel::update_transcription_progress(
+                                        &self.app_handle,
+                                        completed,
+                                        total,
+                                        &cancel,
+                                    );
+                                }
+                            },
+                        );
+                        session.clear_cancel_token();
+                        result
                     }
                     LoadedEngine::Parakeet(parakeet_engine) => {
                         let params = ParakeetParams {
@@ -1398,6 +1503,7 @@ impl TranscriptionManager {
         // family). We don't pass a prompt to non-whisper models (it requires the
         // whisper-kind run extension), so they still get fuzzy correction here,
         // same as the ONNX engines.
+        ensure_not_cancelled(&is_cancelled)?;
         let filtered_result = post_process_transcription_text(result, &settings, model_is_whisper);
 
         let et = std::time::Instant::now();
@@ -1425,6 +1531,7 @@ impl TranscriptionManager {
             info!("Transcription result: {}", final_result);
         }
 
+        drop(batch_guard);
         self.maybe_unload_immediately("transcription");
 
         Ok(final_result)

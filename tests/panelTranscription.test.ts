@@ -126,6 +126,87 @@ test("meeting controls reuse recording commands and discard clears the result", 
   disconnect();
 });
 
+test.each(["file", "meeting"] as const)(
+  "canceling a %s transcription preserves the other job's result",
+  async (job) => {
+    const createSession = await loadSession();
+    const backend = new PanelBackend();
+    const session = createSession(backend);
+    const disconnect = session.connect();
+    await settle();
+    session.useStore.setState({
+      transcripts: { meeting: "Meeting result", file: "File result" },
+    });
+    backend.emit("panel-status-changed", {
+      ...backend.status,
+      phase: "transcribing",
+      file_name: job === "file" ? "long.mp4" : null,
+      progress: { completed: 2, total: 7 },
+    });
+
+    expect(session.useStore.getState().status.progress).toEqual({
+      completed: 2,
+      total: 7,
+    });
+    const invoke = backend.invoke;
+    backend.invoke = async (command, args) => {
+      if (command === "cancel_panel_recording") {
+        backend.emit("panel-transcript-ready", "Canceled result");
+      }
+      return invoke(command, args);
+    };
+
+    await session.runCommand("cancel_panel_recording");
+
+    expect(backend.calls.map(({ command }) => command)).toContain(
+      "cancel_panel_recording",
+    );
+    expect(session.useStore.getState().status.phase).toBe("idle");
+    expect(session.useStore.getState().activeJob).toBeNull();
+    expect(session.useStore.getState().transcripts).toEqual({
+      meeting: job === "meeting" ? null : "Meeting result",
+      file: job === "file" ? null : "File result",
+    });
+    backend.emit("panel-transcript-ready", "Canceled result");
+    expect(session.useStore.getState().transcripts[job]).toBeNull();
+    disconnect();
+  },
+);
+
+test.each(["file", "meeting"] as const)(
+  "a failed %s transcription cancel reports the error to its active job",
+  async (job) => {
+    const createSession = await loadSession();
+    const backend = new PanelBackend();
+    const session = createSession(backend);
+    const disconnect = session.connect();
+    await settle();
+    backend.emit("panel-status-changed", {
+      ...backend.status,
+      phase: "transcribing",
+      file_name: job === "file" ? "long.mp4" : null,
+    });
+    const otherJob = job === "file" ? "meeting" : "file";
+    session.useStore.setState({
+      errors: {
+        ...session.useStore.getState().errors,
+        [otherJob]: "Other error",
+      },
+    });
+    backend.invoke = async () => {
+      throw new Error("Cancel failed");
+    };
+
+    await session.runCommand("cancel_panel_recording");
+
+    expect(session.useStore.getState().errors[job]).toContain("Cancel failed");
+    expect(session.useStore.getState().errors[otherJob]).toBe("Other error");
+    expect(session.useStore.getState().activeJob).toBe(job);
+    expect(session.useStore.getState().pending).toBe(false);
+    disconnect();
+  },
+);
+
 test("a delayed command refresh cannot overwrite a newer panel completion", async () => {
   const createSession = await loadSession();
   const backend = new PanelBackend();

@@ -1,0 +1,60 @@
+name: Personal macOS release
+
+on:
+  push:
+    tags:
+      - "personal-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.repository == 'ncihxaonn/Handy'
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const { version } = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
+            if (process.env.RELEASE_TAG !== `personal-v${version}`) process.exit(1);
+          '
+      - run: bun install --frozen-lockfile
+      - run: bun test tests/*.test.ts tests/*.test.tsx
+      - run: bun run lint
+      - name: Build signed updater and draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          owner: ncihxaonn
+          repo: Handy
+          tauriScript: bun run tauri
+          args: --target aarch64-apple-darwin --bundles app,dmg
+          tagName: ${{ github.ref_name }}
+          releaseName: Handy Personal ${{ github.ref_name }}
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+      - name: Native regression tests
+        run: |
+          cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --lib --bins
+          cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --doc

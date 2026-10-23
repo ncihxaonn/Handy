@@ -72,14 +72,14 @@ export function MeetingRecording() {
                 ? t("meetingRecording.stopRecording")
                 : t("panel.startRecording")}
           </Button>
-          {recording && (
+          {(recording || transcribing) && (
             <Button
               variant="ghost"
               disabled={pending}
               onClick={() => runPanelCommand("cancel_panel_recording")}
               className="focus-visible:ring-2 focus-visible:ring-logo-primary"
             >
-              {t("panel.discard")}
+              {t(recording ? "panel.discard" : "common.cancel")}
             </Button>
           )}
         </div>

@@ -18,15 +18,7 @@ import {
   Upload,
 } from "lucide-react";
 import { syncLanguageFromSettings } from "@/i18n";
-
-type PanelPhase = "idle" | "recording" | "transcribing";
-
-interface PanelStatus {
-  phase: PanelPhase;
-  started_at_ms: number | null;
-  file_name: string | null;
-  error: string | null;
-}
+import type { PanelStatus } from "@/stores/panelTranscriptionStore";
 
 type Notice = { kind: "ok" | "error"; text: string } | null;
 
@@ -270,12 +262,20 @@ export default function MenubarPanel() {
                 ? t("panel.endRecording")
                 : t("panel.startRecording")}
           </span>
-          <span className="hp-record-sub">
+          <span
+            className="hp-record-sub"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
             {recording
               ? t("panel.recordingHint")
               : transcribing
                 ? t("panel.busy")
                 : t("panel.idleHint")}
+            {transcribing && status.progress
+              ? ` ${status.progress.completed} / ${status.progress.total}`
+              : null}
           </span>
         </span>
         {recording && (
@@ -285,12 +285,12 @@ export default function MenubarPanel() {
           </span>
         )}
       </button>
-      {recording && (
+      {busy && (
         <button
           className="hp-link hp-discard"
           onClick={() => runAction("cancel_panel_recording")}
         >
-          {t("panel.discard")}
+          {t(recording ? "panel.discard" : "common.cancel")}
         </button>
       )}
 

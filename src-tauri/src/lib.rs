@@ -42,7 +42,7 @@ use tauri::image::Image;
 pub use transcription_coordinator::TranscriptionCoordinator;
 
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_log::{Builder as LogBuilder, RotationStrategy, Target, TargetKind};
 
@@ -261,7 +261,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 show_main_window(app);
             }
             "check_updates" => {
-                log::info!("Official tray update check ignored in menubar-panel build");
+                show_main_window(app);
+                if let Err(error) = app.emit_to("main", "check-for-updates", ()) {
+                    log::error!("Failed to request Personal update check: {}", error);
+                }
             }
             "copy_last_transcript" => {
                 tray::copy_last_transcript(app);
@@ -310,7 +313,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         .build(app_handle)
         .unwrap();
     log::info!(
-        "Menubar tray created: tray_id={} left_click=panel right_click=menu official_updater=disabled",
+        "Menubar tray created: tray_id={} left_click=panel right_click=menu updater=ncihxaonn/Handy",
         tray.id().as_ref()
     );
     app_handle.manage(tray);
@@ -824,6 +827,7 @@ pub fn run(cli_args: CliArgs) {
     builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
@@ -921,7 +925,7 @@ pub fn run(cli_args: CliArgs) {
             // honors the runtime `--debug` override applied to `settings` above.
             WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
             log::info!(
-                "Handy menubar-panel build started: version={} quick_panel=2 official_updater=disabled executable={:?}",
+                "Handy menubar-panel build started: version={} quick_panel=2 updater=ncihxaonn/Handy executable={:?}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::current_exe()
             );
