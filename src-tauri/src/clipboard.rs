@@ -9,6 +9,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+const MIN_CLIPBOARD_RESTORE_DELAY_MS: u64 = 500;
+
 #[cfg(target_os = "linux")]
 use crate::utils::{is_kde_wayland, is_wayland};
 
@@ -20,61 +22,110 @@ fn paste_via_clipboard(
     paste_method: &PasteMethod,
     paste_delay_ms: u64,
     paste_delay_after_ms: u64,
+    clipboard_handling: ClipboardHandling,
 ) -> Result<(), String> {
-    let clipboard = app_handle.clipboard();
-    let clipboard_content = clipboard.read_text().unwrap_or_default();
+    paste_with_clipboard(
+        &mut ClipboardPasteContext {
+            enigo,
+            app_handle,
+            paste_method,
+        },
+        text,
+        paste_delay_ms,
+        paste_delay_after_ms,
+        clipboard_handling,
+    )
+}
 
-    // Write text to clipboard first
-    // On Wayland, prefer wl-copy for better compatibility (especially with umlauts)
-    #[cfg(target_os = "linux")]
-    let write_result = if is_wayland() && is_wl_copy_available() {
-        info!("Using wl-copy for clipboard write on Wayland");
-        write_clipboard_via_wl_copy(text)
-    } else {
-        clipboard
+trait ClipboardPaste {
+    fn read_text(&mut self) -> Result<String, String>;
+    fn write_text(&mut self, text: &str) -> Result<(), String>;
+    fn send_paste(&mut self) -> Result<(), String>;
+
+    fn revision(&mut self) -> Option<isize> {
+        None
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+struct ClipboardPasteContext<'a> {
+    enigo: &'a mut Enigo,
+    app_handle: &'a AppHandle,
+    paste_method: &'a PasteMethod,
+}
+
+impl ClipboardPaste for ClipboardPasteContext<'_> {
+    fn read_text(&mut self) -> Result<String, String> {
+        self.app_handle
+            .clipboard()
+            .read_text()
+            .map_err(|e| format!("Failed to read clipboard: {}", e))
+    }
+
+    fn write_text(&mut self, text: &str) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if is_wayland() && is_wl_copy_available() {
+            info!("Using wl-copy for clipboard write on Wayland");
+            return write_clipboard_via_wl_copy(text);
+        }
+
+        self.app_handle
+            .clipboard()
             .write_text(text)
             .map_err(|e| format!("Failed to write to clipboard: {}", e))
-    };
+    }
 
-    #[cfg(not(target_os = "linux"))]
-    let write_result = clipboard
-        .write_text(text)
-        .map_err(|e| format!("Failed to write to clipboard: {}", e));
+    fn send_paste(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if try_send_key_combo_linux(self.paste_method)? {
+            return Ok(());
+        }
 
-    write_result?;
-
-    std::thread::sleep(Duration::from_millis(paste_delay_ms));
-
-    // Send paste key combo
-    #[cfg(target_os = "linux")]
-    let key_combo_sent = try_send_key_combo_linux(paste_method)?;
-
-    #[cfg(not(target_os = "linux"))]
-    let key_combo_sent = false;
-
-    // Fall back to enigo if no native tool handled it
-    if !key_combo_sent {
-        match paste_method {
-            PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo)?,
-            PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo)?,
-            PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo)?,
-            _ => return Err("Invalid paste method for clipboard paste".into()),
+        match self.paste_method {
+            PasteMethod::CtrlV => input::send_paste_ctrl_v(self.enigo),
+            PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(self.enigo),
+            PasteMethod::ShiftInsert => input::send_paste_shift_insert(self.enigo),
+            _ => Err("Invalid paste method for clipboard paste".into()),
         }
     }
 
-    std::thread::sleep(Duration::from_millis(paste_delay_after_ms));
+    fn revision(&mut self) -> Option<isize> {
+        #[cfg(target_os = "macos")]
+        {
+            use tauri_nspanel::objc2_app_kit::NSPasteboard;
+            Some(NSPasteboard::generalPasteboard().changeCount())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+}
 
-    // Restore original clipboard content
-    // On Wayland, prefer wl-copy for better compatibility
-    #[cfg(target_os = "linux")]
-    if is_wayland() && is_wl_copy_available() {
-        let _ = write_clipboard_via_wl_copy(&clipboard_content);
-    } else {
+fn paste_with_clipboard(
+    clipboard: &mut impl ClipboardPaste,
+    text: &str,
+    paste_delay_ms: u64,
+    paste_delay_after_ms: u64,
+    clipboard_handling: ClipboardHandling,
+) -> Result<(), String> {
+    let clipboard_content = clipboard.read_text().unwrap_or_default();
+    clipboard.write_text(text)?;
+    let revision = clipboard.revision();
+    clipboard.wait(Duration::from_millis(paste_delay_ms));
+    clipboard.send_paste()?;
+    clipboard.wait(Duration::from_millis(
+        paste_delay_after_ms.max(MIN_CLIPBOARD_RESTORE_DELAY_MS),
+    ));
+    if clipboard_handling == ClipboardHandling::DontModify
+        && clipboard.revision() == revision
+        && clipboard.read_text().as_deref() == Ok(text)
+    {
         let _ = clipboard.write_text(&clipboard_content);
     }
-
-    #[cfg(not(target_os = "linux"))]
-    let _ = clipboard.write_text(&clipboard_content);
 
     Ok(())
 }
@@ -637,6 +688,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                 &paste_method,
                 paste_delay_ms,
                 paste_delay_after_ms,
+                settings.clipboard_handling,
             )?
         }
         PasteMethod::ExternalScript => {
@@ -655,7 +707,12 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     }
 
     // After pasting, optionally copy to clipboard based on settings
-    if settings.clipboard_handling == ClipboardHandling::CopyToClipboard {
+    if settings.clipboard_handling == ClipboardHandling::CopyToClipboard
+        && !matches!(
+            paste_method,
+            PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert
+        )
+    {
         let clipboard = app_handle.clipboard();
         clipboard
             .write_text(&text)
@@ -668,6 +725,131 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DelayedClipboard {
+        text: String,
+        revision: isize,
+        elapsed: Duration,
+        paste_due: Option<Duration>,
+        pasted: Vec<String>,
+        replacement: Option<(Duration, String)>,
+    }
+
+    impl DelayedClipboard {
+        fn new() -> Self {
+            Self {
+                text: "previous transcription".to_string(),
+                revision: 0,
+                elapsed: Duration::ZERO,
+                paste_due: None,
+                pasted: Vec::new(),
+                replacement: None,
+            }
+        }
+    }
+
+    impl ClipboardPaste for DelayedClipboard {
+        fn read_text(&mut self) -> Result<String, String> {
+            Ok(self.text.clone())
+        }
+
+        fn write_text(&mut self, text: &str) -> Result<(), String> {
+            self.text = text.to_string();
+            self.revision += 1;
+            Ok(())
+        }
+
+        fn send_paste(&mut self) -> Result<(), String> {
+            self.paste_due = Some(self.elapsed + Duration::from_millis(300));
+            Ok(())
+        }
+
+        fn revision(&mut self) -> Option<isize> {
+            Some(self.revision)
+        }
+
+        fn wait(&mut self, duration: Duration) {
+            let until = self.elapsed + duration;
+            loop {
+                let paste_due = self.paste_due.unwrap_or(Duration::MAX);
+                let replacement_due = self
+                    .replacement
+                    .as_ref()
+                    .map(|(due, _)| *due)
+                    .unwrap_or(Duration::MAX);
+                let next = paste_due.min(replacement_due);
+                if next > until {
+                    break;
+                }
+                self.elapsed = next;
+                if paste_due <= replacement_due {
+                    self.pasted.push(self.text.clone());
+                    self.paste_due = None;
+                } else if let Some((_, text)) = self.replacement.take() {
+                    self.write_text(&text).unwrap();
+                }
+            }
+            self.elapsed = until;
+        }
+    }
+
+    #[test]
+    fn delayed_paste_reads_latest_transcription_before_clipboard_restore() {
+        let mut clipboard = DelayedClipboard::new();
+
+        paste_with_clipboard(
+            &mut clipboard,
+            "latest transcription",
+            60,
+            60,
+            ClipboardHandling::DontModify,
+        )
+        .unwrap();
+        clipboard.wait(Duration::from_millis(500));
+
+        assert_eq!(clipboard.pasted, ["latest transcription"]);
+        assert_eq!(clipboard.text, "previous transcription");
+    }
+
+    #[test]
+    fn clipboard_restore_preserves_a_new_copy_of_the_same_text() {
+        let mut clipboard = DelayedClipboard {
+            replacement: Some((
+                Duration::from_millis(400),
+                "latest transcription".to_string(),
+            )),
+            ..DelayedClipboard::new()
+        };
+
+        paste_with_clipboard(
+            &mut clipboard,
+            "latest transcription",
+            60,
+            60,
+            ClipboardHandling::DontModify,
+        )
+        .unwrap();
+
+        assert_eq!(clipboard.pasted, ["latest transcription"]);
+        assert_eq!(clipboard.text, "latest transcription");
+    }
+
+    #[test]
+    fn copy_to_clipboard_does_not_temporarily_restore_old_text() {
+        let mut clipboard = DelayedClipboard::new();
+
+        paste_with_clipboard(
+            &mut clipboard,
+            "latest transcription",
+            60,
+            60,
+            ClipboardHandling::CopyToClipboard,
+        )
+        .unwrap();
+
+        assert_eq!(clipboard.pasted, ["latest transcription"]);
+        assert_eq!(clipboard.text, "latest transcription");
+    }
 
     #[test]
     fn auto_submit_requires_setting_enabled() {

@@ -796,32 +796,34 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
                                 let rm_for_paste = Arc::clone(&rm);
-                                ah.run_on_main_thread(move || {
-                                    if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                        debug!("Transcription operation cancelled before paste");
-                                        utils::hide_recording_overlay(&ah_clone);
-                                        change_tray_icon(&ah_clone, TrayIconState::Idle);
-                                        return;
-                                    }
-
-                                    match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to paste transcription: {}", e);
-                                            let _ = ah_clone.emit("paste-error", ());
+                                let paste_result =
+                                    tauri::async_runtime::spawn_blocking(move || {
+                                        if rm_for_paste.was_cancelled_since(cancel_generation) {
+                                            return None;
                                         }
+                                        Some(utils::paste(final_text, ah_clone))
+                                    })
+                                    .await;
+
+                                match paste_result {
+                                    Ok(Some(Ok(()))) => debug!(
+                                        "Text pasted successfully in {:?}",
+                                        paste_time.elapsed()
+                                    ),
+                                    Ok(Some(Err(e))) => {
+                                        error!("Failed to paste transcription: {}", e);
+                                        let _ = ah.emit("paste-error", ());
                                     }
-                                    utils::hide_recording_overlay(&ah_clone);
-                                    change_tray_icon(&ah_clone, TrayIconState::Idle);
-                                })
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    change_tray_icon(&ah, TrayIconState::Idle);
-                                });
+                                    Ok(None) => {
+                                        debug!("Transcription operation cancelled before paste");
+                                    }
+                                    Err(e) => {
+                                        error!("Paste task failed: {}", e);
+                                        let _ = ah.emit("paste-error", ());
+                                    }
+                                }
+                                utils::hide_recording_overlay(&ah);
+                                change_tray_icon(&ah, TrayIconState::Idle);
                             }
                         }
                         Err(err) => {
